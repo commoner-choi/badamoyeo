@@ -14,8 +14,6 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
-import org.springframework.web.client.RestClient;
-import org.springframework.web.client.RestClientResponseException;
 import org.springframework.web.server.ResponseStatusException;
 import org.springframework.web.util.UriComponentsBuilder;
 import org.springframework.web.util.UriUtils;
@@ -30,21 +28,26 @@ import badamoyeo_api.ingestion.dto.ForecastUpsertRequest;
 import badamoyeo_api.ingestion.dto.IngestionResult;
 import badamoyeo_api.ingestion.dto.SpotIdLookup;
 import badamoyeo_api.ingestion.dto.SpotUpsertRequest;
+import badamoyeo_api.ingestion.fetch.BlockFetchOutcome;
+import badamoyeo_api.ingestion.fetch.BlockFetcher;
 import badamoyeo_api.ingestion.mapper.MarineForecastIngestionMapper;
 import badamoyeo_api.spot.dto.Experience;
 
+/**
+ * 해양예보 공공데이터를 카테고리별로 수집해 스팟/예보 테이블에 반영한다.
+ *
+ * <p>HTTP 호출과 실패 복구는 {@link BlockFetcher} 에 있다. 이 클래스는 카테고리 목록을 돌면서
+ * 받아낸 블록을 저장하고 측정값을 모으는 역할만 한다.
+ */
 @Service
 public class MarineForecastIngestionService {
 	private static final Logger log = LoggerFactory.getLogger(MarineForecastIngestionService.class);
-	private static final int[] PAGE_SIZES = {300, 100, 50, 10};
-	private static final int MAX_FETCH_ATTEMPTS = 3;
-	private static final long FETCH_RETRY_DELAY_MILLIS = 500;
 	private static final DateTimeFormatter REQUEST_DATE_FORMATTER = DateTimeFormatter.BASIC_ISO_DATE;
 
 	private final MarineForecastIngestionMapper ingestionMapper;
 	private final RegionResolver regionResolver;
 	private final TransactionTemplate transactionTemplate;
-	private final RestClient restClient;
+	private final BlockFetcher blockFetcher;
 	private final ObjectMapper objectMapper;
 	private final String serviceKey;
 
@@ -52,15 +55,16 @@ public class MarineForecastIngestionService {
 		MarineForecastIngestionMapper ingestionMapper,
 		RegionResolver regionResolver,
 		TransactionTemplate transactionTemplate,
+		BlockFetcher blockFetcher,
 		ObjectMapper objectMapper,
 		@Value("${openapi.marine.service-key:}") String serviceKey
 	) {
 		this.ingestionMapper = ingestionMapper;
 		this.regionResolver = regionResolver;
 		this.transactionTemplate = transactionTemplate;
+		this.blockFetcher = blockFetcher;
 		this.objectMapper = objectMapper;
 		this.serviceKey = serviceKey;
-		this.restClient = RestClient.create();
 	}
 
 	public List<IngestionResult> ingestAll(LocalDate targetDate) {
@@ -71,16 +75,17 @@ public class MarineForecastIngestionService {
 		LocalDate requestDate = targetDate == null ? LocalDate.now() : targetDate;
 		List<IngestionResult> results = new ArrayList<>();
 		for (ApiSpec spec : apiSpecs()) {
+			// 한 카테고리에서 무엇이 터지든 다음 카테고리는 계속한다.
+			// 예전에는 ResponseStatusException 만 잡아서 네트워크 타임아웃이 이 루프를 뚫고 나갔다.
 			try {
 				results.add(ingest(spec, requestDate));
-			} catch (ResponseStatusException exception) {
-				log.warn("Skip marine forecast experience. experience={}, date={}, status={}, reason={}",
-					spec.experience().apiValue(),
-					requestDate,
-					exception.getStatusCode(),
-					exception.getReason());
+			} catch (RuntimeException exception) {
+				log.error("Skip marine forecast experience. experience={}, date={}",
+					spec.experience().apiValue(), requestDate, exception);
+				results.add(IngestionResult.empty(spec.experience().apiValue(), exception.toString()));
 			}
 		}
+		logSummary(requestDate, results);
 		return results;
 	}
 
@@ -96,160 +101,41 @@ public class MarineForecastIngestionService {
 	}
 
 	private IngestionResult ingest(ApiSpec spec, LocalDate requestDate) {
-		int pageNo = 1;
-		int totalCount = 0;
-		int fetchedCount = 0;
-		int savedCount = 0;
+		String label = spec.experience().apiValue() + "@" + requestDate;
+		int[] savedCount = {0};
 
-		do {
-			FetchPage page = fetchPageWithFallback(spec, requestDate, pageNo, PAGE_SIZES[0], totalCount, 0);
-			List<JsonNode> items = page.items();
-			totalCount = page.totalCount();
+		// 블록 하나를 받을 때마다 바로 저장한다. 뒤쪽 블록이 실패해도 여기까지는 이미 커밋되어 남는다.
+		BlockFetchOutcome outcome = blockFetcher.fetchAll(
+			(pageNo, numOfRows) -> forecastUri(spec, requestDate, pageNo, numOfRows),
+			label,
+			items -> savedCount[0] += saveItems(spec, items));
 
-			fetchedCount += items.size();
-			savedCount += saveItems(spec, items);
-
-			pageNo++;
-		} while ((pageNo - 1) * PAGE_SIZES[0] < totalCount);
-
-		return new IngestionResult(spec.experience().apiValue(), fetchedCount, savedCount);
-	}
-
-	private FetchPage fetchPageWithFallback(ApiSpec spec, LocalDate requestDate, int pageNo, int pageSize,
-		int knownTotalCount, int pageSizeIndex) {
-		try {
-			return fetchPage(spec, requestDate, pageNo, pageSize);
-		} catch (ResponseStatusException exception) {
-			if (!shouldRetry(exception) || pageSizeIndex >= PAGE_SIZES.length - 1) {
-				throw exception;
-			}
-			int fallbackPageSize = PAGE_SIZES[pageSizeIndex + 1];
-			log.warn("Fallback to smaller marine forecast pages. experience={}, date={}, pageNo={}, numOfRows={}, fallbackNumOfRows={}, status={}, reason={}",
-				spec.experience().apiValue(),
-				requestDate,
-				pageNo,
-				pageSize,
-				fallbackPageSize,
-				exception.getStatusCode(),
-				exception.getReason());
-			return fetchFallbackPage(spec, requestDate, pageNo, pageSize, fallbackPageSize, knownTotalCount, pageSizeIndex + 1);
-		}
-	}
-
-	private FetchPage fetchFallbackPage(ApiSpec spec, LocalDate requestDate, int primaryPageNo, int primaryPageSize,
-		int fallbackPageSize, int knownTotalCount, int fallbackPageSizeIndex) {
-		int firstRow = (primaryPageNo - 1) * primaryPageSize + 1;
-		int lastRow = knownTotalCount > 0 ? Math.min(primaryPageNo * primaryPageSize, knownTotalCount) : primaryPageNo * primaryPageSize;
-		int firstFallbackPageNo = (firstRow - 1) / fallbackPageSize + 1;
-		int lastFallbackPageNo = (lastRow - 1) / fallbackPageSize + 1;
-
-		List<JsonNode> items = new ArrayList<>();
-		int totalCount = knownTotalCount;
-		for (int fallbackPageNo = firstFallbackPageNo; fallbackPageNo <= lastFallbackPageNo; fallbackPageNo++) {
-			FetchPage fallbackPage = fetchPageWithFallback(spec, requestDate, fallbackPageNo, fallbackPageSize, totalCount, fallbackPageSizeIndex);
-			totalCount = fallbackPage.totalCount();
-			items.addAll(fallbackPage.items());
-			if (fallbackPageNo == firstFallbackPageNo && knownTotalCount == 0) {
-				lastRow = Math.min(primaryPageNo * primaryPageSize, totalCount);
-				lastFallbackPageNo = (lastRow - 1) / fallbackPageSize + 1;
-			}
-		}
-
-		log.info("Fetched marine forecast page by fallback. experience={}, date={}, pageNo={}, numOfRows={}, fallbackNumOfRows={}, totalCount={}, itemCount={}",
+		return new IngestionResult(
 			spec.experience().apiValue(),
-			requestDate,
-			primaryPageNo,
-			primaryPageSize,
-			fallbackPageSize,
-			totalCount,
-			items.size());
-		return new FetchPage(items, totalCount);
+			outcome.totalCount(),
+			outcome.fetchedCount(),
+			savedCount[0],
+			outcome.requestCount(),
+			outcome.retryCount(),
+			outcome.splitCount(),
+			outcome.failedRanges());
 	}
 
-	private FetchPage fetchPage(ApiSpec spec, LocalDate requestDate, int pageNo, int pageSize) {
-		for (int attempt = 1; attempt <= MAX_FETCH_ATTEMPTS; attempt++) {
-			try {
-				FetchPage page = fetchPageOnce(spec, requestDate, pageNo, pageSize);
-				log.info("Fetched marine forecast page. experience={}, date={}, pageNo={}, numOfRows={}, totalCount={}, itemCount={}",
-					spec.experience().apiValue(),
-					requestDate,
-					pageNo,
-					pageSize,
-					page.totalCount(),
-					page.items().size());
-				return page;
-			} catch (ResponseStatusException exception) {
-				if (attempt == MAX_FETCH_ATTEMPTS || !shouldRetry(exception)) {
-					throw exception;
-				}
-				log.warn("Retry marine forecast page. experience={}, date={}, pageNo={}, numOfRows={}, attempt={}, status={}, reason={}",
-					spec.experience().apiValue(),
-					requestDate,
-					pageNo,
-					pageSize,
-					attempt,
-					exception.getStatusCode(),
-					exception.getReason());
-				sleepBeforeRetry();
+	private void logSummary(LocalDate requestDate, List<IngestionResult> results) {
+		int totalCount = results.stream().mapToInt(IngestionResult::totalCount).sum();
+		int fetchedCount = results.stream().mapToInt(IngestionResult::fetchedCount).sum();
+		int lostRows = results.stream().mapToInt(IngestionResult::lostRowCount).sum();
+		long incomplete = results.stream().filter(result -> !result.complete()).count();
+		double coverage = totalCount <= 0 ? 1.0 : (double) fetchedCount / totalCount;
+
+		log.info("Marine forecast ingestion summary. date={}, coverage={}, totalCount={}, fetched={}, lostRows={}, incompleteExperiences={}/{}",
+			requestDate, String.format("%.4f", coverage), totalCount, fetchedCount, lostRows, incomplete, results.size());
+
+		for (IngestionResult result : results) {
+			if (!result.complete()) {
+				log.warn("Incomplete experience ingestion. experience={}, coverage={}, lostRows={}, failedRanges={}",
+					result.experience(), String.format("%.4f", result.coverage()), result.lostRowCount(), result.failedRanges());
 			}
-		}
-		throw new ResponseStatusException(HttpStatus.BAD_GATEWAY, "failed to fetch open api response");
-	}
-
-	private FetchPage fetchPageOnce(ApiSpec spec, LocalDate requestDate, int pageNo, int pageSize) {
-		URI uri = forecastUri(spec, requestDate, pageNo, pageSize);
-
-		String responseBody;
-		try {
-			responseBody = restClient.get()
-				.uri(uri)
-				.retrieve()
-				.body(String.class);
-		} catch (RestClientResponseException exception) {
-			throw new ResponseStatusException(exception.getStatusCode(),
-				"open api http error: experience=" + spec.experience().apiValue()
-					+ ", date=" + requestDate
-					+ ", pageNo=" + pageNo
-					+ ", status=" + exception.getStatusCode()
-					+ ", body=" + sanitizeResponseBody(exception.getResponseBodyAsString()),
-				exception);
-		}
-
-		if (responseBody == null || responseBody.isBlank()) {
-			throw new ResponseStatusException(HttpStatus.BAD_GATEWAY, "empty open api response");
-		}
-
-		JsonNode root = parseJson(responseBody);
-		JsonNode envelope = root.has("response") ? root.path("response") : root;
-		JsonNode header = envelope.path("header");
-		String resultCode = header.path("resultCode").asText();
-		if (!"00".equals(resultCode)) {
-			String resultMsg = header.path("resultMsg").asText("open api request failed");
-			throw new ResponseStatusException(HttpStatus.BAD_GATEWAY,
-				"open api request failed: experience=" + spec.experience().apiValue()
-					+ ", date=" + requestDate
-					+ ", pageNo=" + pageNo
-					+ ", resultCode=" + resultCode
-					+ ", resultMsg=" + resultMsg);
-		}
-
-		JsonNode body = envelope.path("body");
-		return new FetchPage(asArray(body.path("items").path("item")), body.path("totalCount").asInt(0));
-	}
-
-	private boolean shouldRetry(ResponseStatusException exception) {
-		if (exception.getStatusCode().is5xxServerError()) {
-			return true;
-		}
-		return exception.getReason() != null && exception.getReason().contains("resultCode=99");
-	}
-
-	private void sleepBeforeRetry() {
-		try {
-			Thread.sleep(FETCH_RETRY_DELAY_MILLIS);
-		} catch (InterruptedException exception) {
-			Thread.currentThread().interrupt();
-			throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "interrupted while retrying open api request", exception);
 		}
 	}
 
@@ -274,34 +160,6 @@ public class MarineForecastIngestionService {
 			return value;
 		}
 		return UriUtils.encodeQueryParam(value, StandardCharsets.UTF_8);
-	}
-
-	private String sanitizeResponseBody(String body) {
-		if (body == null || body.isBlank()) {
-			return "";
-		}
-		String compact = body.replaceAll("\\s+", " ").trim();
-		return compact.length() > 200 ? compact.substring(0, 200) : compact;
-	}
-
-	private JsonNode parseJson(String responseBody) {
-		try {
-			return objectMapper.readTree(responseBody);
-		} catch (Exception exception) {
-			throw new ResponseStatusException(HttpStatus.BAD_GATEWAY, "invalid open api response", exception);
-		}
-	}
-
-	private List<JsonNode> asArray(JsonNode items) {
-		if (items == null || items.isMissingNode() || items.isNull()) {
-			return List.of();
-		}
-		if (items.isArray()) {
-			List<JsonNode> nodes = new ArrayList<>();
-			items.forEach(nodes::add);
-			return nodes;
-		}
-		return List.of(items);
 	}
 
 	private int saveItems(ApiSpec spec, List<JsonNode> items) {
@@ -538,8 +396,5 @@ public class MarineForecastIngestionService {
 	}
 
 	private record MetricField(String apiField, String sourceField) {
-	}
-
-	private record FetchPage(List<JsonNode> items, int totalCount) {
 	}
 }
